@@ -1,12 +1,17 @@
 ﻿using System;
+using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Data;
+using System.Windows.Documents;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using CommunityToolkit.Mvvm.Messaging;
 using CurvaLauncher.Messages;
+using CurvaLauncher.Models.ImmediateResults;
 using CurvaLauncher.Services;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -14,25 +19,44 @@ namespace CurvaLauncher.Models;
 
 public partial class QueryResultModel : ObservableObject
 {
+    private readonly PluginInstance _pluginInstance;
     private readonly IQueryResult _rawQueryResult;
 
-    private QueryResultModel(float weight, string title, string description, ImageSource? icon, IQueryResult rawQueryResult)
+    public QueryResultModel(PluginInstance pluginInstance, IQueryResult rawQueryResult)
     {
-        Weight = weight;
-        Title = title;
-        Description = description;
-        _icon = icon;
+        _pluginInstance = pluginInstance;
         _rawQueryResult = rawQueryResult;
+        _icon = rawQueryResult.Icon;
+
+        if (rawQueryResult is IQueryResultWithPreview queryResultWithPreview)
+        {
+            Preview = queryResultWithPreview.GeneratePreview();
+
+            if (Preview is not null &&
+                App.Current.MainWindow is not null)
+            {
+                var fontFamilyLocalValue = Preview.ReadLocalValue(FlowDocument.FontFamilyProperty);
+                if (fontFamilyLocalValue == DependencyProperty.UnsetValue ||
+                    fontFamilyLocalValue == Binding.DoNothing)
+                {
+                    Preview.FontFamily = App.Current.MainWindow.FontFamily;
+                }
+            }
+        }
+
+        SetupFallbackIcon(() => pluginInstance.Plugin.Icon);
     }
 
     private ImageSource? _icon;
 
-    public float Weight { get; }
-    public string Title { get; }
-    public string Description { get; }
+    public float Weight => _pluginInstance.Weight * _rawQueryResult.Weight;
+    public string Title => _rawQueryResult.Title;
+    public string Description => _rawQueryResult.Description;
+    public bool HasPreview => Preview is not null;
     public ImageSource? Icon => _icon;
+    public FlowDocument? Preview { get; }
 
-    public void SetFallbackIcon(Func<ImageSource> iconFactory)
+    private void SetupFallbackIcon(Func<ImageSource> iconFactory)
     {
         if (_icon == null)
         {
@@ -50,45 +74,53 @@ public partial class QueryResultModel : ObservableObject
         }
     }
 
-    [RelayCommand]
-    public async Task Invoke()
+    public async Task<ImmediateResult?> Invoke(CancellationToken cancellationToken)
     {
         App.ServiceProvider
             .GetRequiredService<IMessenger>()
             .Send(SaveQueryMessage.Instance);
 
-        if (_rawQueryResult is ISyncQueryResult syncQueryResult)
+        try
         {
-            try
+            if (_rawQueryResult is ISyncActionQueryResult syncQueryResult)
             {
                 syncQueryResult.Invoke();
+                App.CloseLauncher();
             }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"{ex.Message}", "CurvaLauncher Result Invoke failed", MessageBoxButton.OK, MessageBoxImage.Error);
-            }
-        }
-        else if (_rawQueryResult is IAsyncQueryResult asyncQueryResult)
-        {
-            try
+            else if (_rawQueryResult is IAsyncActionQueryResult asyncQueryResult)
             {
                 await asyncQueryResult.InvokeAsync(App.GetLauncherCancellationToken());
+                App.CloseLauncher();
             }
-            catch (OperationCanceledException)
+            else if (_rawQueryResult is ISyncDocumentQueryResult syncDocumentQueryResult)
             {
-                // pass
+                return new DocumentResult(syncDocumentQueryResult.GenerateDocument());
             }
-            catch (Exception ex)
+            else if (_rawQueryResult is IAsyncDocumentQueryResult asyncDocumentQueryResult)
             {
-                MessageBox.Show($"{ex.Message}", "CurvaLauncher Result Invoke failed", MessageBoxButton.OK, MessageBoxImage.Error);
+                var document = await asyncDocumentQueryResult.GenerateDocumentAsync(cancellationToken);
+                return new DocumentResult(document);
+            }
+            else if (_rawQueryResult is ISyncMenuQueryResult syncMenuQueryResult)
+            {
+                var menuItems = syncMenuQueryResult.GetMenuItems();
+                return new MenuResult(_pluginInstance, menuItems.ToList());
+            }
+            else if (_rawQueryResult is IAsyncMenuQueryResult asyncMenuQueryResult)
+            {
+                var menuItems = await asyncMenuQueryResult.GetMenuItemsAsync(cancellationToken);
+                return new MenuResult(_pluginInstance, menuItems.ToList());
             }
         }
+        catch (OperationCanceledException)
+        {
+            // pass
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"{ex.Message}", "CurvaLauncher Result Invoke failed", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
 
-        App.CloseLauncher();
-    }
-
-    public static QueryResultModel Create(CurvaLauncherPluginInstance pluginInstance, IQueryResult queryResult)
-    {
-        return new QueryResultModel(pluginInstance.Weight * queryResult.Weight, queryResult.Title, queryResult.Description, queryResult.Icon, queryResult);
+        return null;
     }
 }

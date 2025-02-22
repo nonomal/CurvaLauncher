@@ -6,14 +6,14 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text.Json;
-using System.Text.Json.Nodes;
-using System.Text.Json.Serialization.Metadata;
 using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.Input;
 using CurvaLauncher.Models;
 using CurvaLauncher.Plugins;
-using CurvaLauncher.PluginInteraction;
 using System.Diagnostics;
+using System.IO.Compression;
+using System.Runtime.Loader;
+using IOPath = System.IO.Path;
 
 namespace CurvaLauncher.Services;
 
@@ -24,7 +24,7 @@ public partial class PluginService
 
     public string Path { get; set; } = "Plugins";
 
-    public ObservableCollection<CurvaLauncherPluginInstance> PluginInstances { get; } = new();
+    public ObservableCollection<PluginInstance> PluginInstances { get; } = new();
 
     public PluginService(
         PathService pathService,
@@ -45,70 +45,85 @@ public partial class PluginService
         return dir;
     }
 
-    private void CoreLoadPlugins(out List<CurvaLauncherPluginInstance> plugins)
+    private void CoreLoadPlugins(out List<PluginInstance> plugins)
     {
-        plugins = new List<CurvaLauncherPluginInstance>();
+        plugins = new List<PluginInstance>();
 
         var dir = EnsurePluginDirectory();
-        var dllFiles = dir.GetFiles("*.dll");
 
         AppConfig config = _configService.Config;
 
-        foreach (FileInfo dllFile in dllFiles)
-            if (CoreLoadPlugin(config, dllFile.FullName, out CurvaLauncherPluginInstance? plugin))
+        foreach (var dllFile in dir.GetFiles("*.dll"))
+        {
+            if (CoreLoadDllPlugin(config, dllFile.FullName, out PluginInstance? plugin))
             {
                 plugins.Add(plugin);
             }
+        }
+
+        foreach (var zipFile in dir.GetFiles("*.zip"))
+        {
+            if (CoreLoadZipPlugin(config, zipFile.FullName, out PluginInstance? plugin))
+            {
+                plugins.Add(plugin);
+            }
+        }
     }
 
-    private bool CoreLoadPlugin(AppConfig config, string dllFilePath, [NotNullWhen(true)] out CurvaLauncherPluginInstance? pluginInstance)
+    private bool CoreLoadPluginFromAssembly(AppConfig config, Assembly assembly, [NotNullWhen(true)] out PluginInstance? pluginInstance)
+    {
+        pluginInstance = null;
+
+        Type? pluginType = assembly.ExportedTypes
+                .Where(type => type.IsAssignableTo(typeof(ISyncPlugin)) || type.IsAssignableTo(typeof(IAsyncPlugin)))
+                .FirstOrDefault();
+
+        if (pluginType == null)
+            return false;
+
+        if (!PluginInstance.TryCreate(pluginType, out pluginInstance))
+            return false;
+
+        var typeName = pluginType.FullName!;
+
+        if (config.Plugins.TryGetValue(typeName, out var pluginConfig))
+        {
+            var props = pluginInstance.Plugin.GetType().GetProperties()
+                        .Where(p => p.GetCustomAttribute<PluginOptionAttribute>() is not null
+                            || p.GetCustomAttribute<PluginI18nOptionAttribute>() is not null);
+
+            if (pluginConfig.Options != null)
+            {
+                foreach (var property in props)
+                {
+                    if (pluginConfig.Options.TryGetPropertyValue(property.Name, out var value))
+                    {
+                        var type = property.PropertyType;
+                        var val = JsonSerializer.Deserialize(value, type);
+                        property.SetValue(pluginInstance.Plugin, val);
+                    }
+                }
+            }
+
+            pluginInstance.IsEnabled = pluginConfig.IsEnabled;
+            pluginInstance.Weight = pluginConfig.Weight;
+        }
+        else
+        {
+            pluginInstance.IsEnabled = true;
+        }
+
+        return true;
+    }
+
+    private bool CoreLoadDllPlugin(AppConfig config, string dllFilePath, [NotNullWhen(true)] out PluginInstance? pluginInstance)
     {
         pluginInstance = null;
 
         try
         {
             var assembly = Assembly.LoadFile(dllFilePath);
-
-            Type? pluginType = assembly.ExportedTypes
-                .Where(type => type.IsAssignableTo(typeof(ISyncPlugin)) || type.IsAssignableTo(typeof(IAsyncPlugin)))
-                .FirstOrDefault();
-
-            if (pluginType == null)
-                return false;
-
-            if (!CurvaLauncherPluginInstance.TryCreate(pluginType, out pluginInstance))
-                return false;
-
-            var typeName = pluginType.FullName!;
-
-            if (config.Plugins.TryGetValue(typeName, out var pluginConfig))
-            {
-                var props = pluginInstance.Plugin.GetType().GetProperties()
-                        .Where(p => p.GetCustomAttribute<PluginOptionAttribute>() is not null
-                            || p.GetCustomAttribute<PluginI18nOptionAttribute>() is not null);
-
-                if (pluginConfig.Options != null)
-                {
-                    foreach (var property in props)
-                    {
-                        if (pluginConfig.Options.TryGetPropertyValue(property.Name, out var value))
-                        {
-                            var type = property.PropertyType;
-                            var val = JsonSerializer.Deserialize(value, type);
-                            property.SetValue(pluginInstance.Plugin, val);
-                        }
-                    }
-                }
-
-                pluginInstance.IsEnabled = pluginConfig.IsEnabled;
-                pluginInstance.Weight = pluginConfig.Weight;
-            }
-            else
-            {
-                pluginInstance.IsEnabled = true;
-            }
-
-            return true;
+            return CoreLoadPluginFromAssembly(config, assembly, out pluginInstance);
         }
         catch (Exception ex)
         {
@@ -117,7 +132,36 @@ public partial class PluginService
         }
     }
 
-    private void MoveCommandPluginsToTheBeginning(IList<CurvaLauncherPluginInstance> plugins)
+    private bool CoreLoadZipPlugin(AppConfig config, string zipFilePath, [NotNullWhen(true)] out PluginInstance? pluginInstance)
+    {
+        pluginInstance = null;
+
+        try
+        {
+            using var zipFile = File.OpenRead(zipFilePath);
+            string extractDir = IOPath.Combine(".cache", IOPath.GetFileNameWithoutExtension(zipFilePath));
+            if (Directory.Exists(extractDir))
+                Directory.Delete(extractDir, true);
+            ZipFile.ExtractToDirectory(zipFile, extractDir);
+
+            var manifestJson = File.ReadAllText(IOPath.Combine(extractDir, "Manifest.json"));
+            var manifest = JsonSerializer.Deserialize<PluginManifest>(manifestJson);
+            if (manifest is null)
+                return false;
+
+            var assemblyPath = IOPath.GetFullPath(IOPath.Combine(extractDir, manifest.Assembly));
+            var alc = new PluginAssemblyLoadContext(manifest.ID, assemblyPath);
+            Assembly assembly = alc.LoadFromAssemblyPath(assemblyPath);
+            return CoreLoadPluginFromAssembly(config, assembly, out pluginInstance);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Plugin load failed, {ex}");
+            return false;
+        }
+    }
+
+    private void MoveCommandPluginsToTheBeginning(IList<PluginInstance> plugins)
     {
         int indexStart = 0;
         for (int i = 1; i < plugins.Count; i++)
